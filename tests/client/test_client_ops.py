@@ -30,13 +30,17 @@ import pytest
 from pydantic import ValidationError
 
 from arctic_platform.client import OPS
+from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import AsyncArcticClient
 from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
+from arctic_platform.client import TrainingConfig
 from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
 from arctic_platform.client import requests as cluster_requests
@@ -834,6 +838,97 @@ class TestCortexSharedHelper:
         absent = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}})
         assert "balance_batch" not in absent["context"]
 
+    def test_forwards_onprem_meta_scalars_onto_context(self):
+        """On-prem reads max_prompt_len and zorro_train_enable from meta.
+        Cortex must receive those same client values on context."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {
+                    "max_prompt_len": 6,
+                    "zorro_train_enable": True,
+                    "max_response_len": 4,
+                    "dp_size": 8,
+                },
+            },
+        )
+        assert out["context"]["max_prompt_len"] == 6
+        assert out["context"]["zorro_train_enable"] is True
+        assert out["context"]["max_response_len"] == 4
+        assert "dp_size" not in out["context"]
+        assert "dp_size" not in out["processing"]["config"]
+
+    def test_rejects_zorro_meta_that_is_missing_max_prompt_len(self):
+        import pytest
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        batch = {
+            "input_ids": torch.zeros((2, 10), dtype=torch.int64),
+            "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+            "advantages": torch.zeros((2, 10)),
+            "response_mask": torch.ones((2, 10), dtype=torch.int64),
+        }
+        with pytest.raises(ValueError, match="max_prompt_len"):
+            to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"zorro_train_enable": True}})
+        legacy = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"load_balancer": True}})
+        assert "load_balancer" not in legacy["context"]
+
+    def test_aligned_batch_tensors_win_over_meta_copies(self):
+        """``input_ids``, ``advantages``, and ``loss_mask`` are set onto
+        context from the (left-aligned) batch *after* the meta bag is copied
+        in, so a caller that happens to also stash those names on meta must
+        not have its stale copies survive onto the wire."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        adv = torch.tensor([[0.0, 0.0, 0.5, 0.5], [0.0, 0.0, -0.25, -0.25]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+
+        decoy_ids = torch.full((2, 4), -1, dtype=torch.long)
+        decoy_adv = torch.full((2, 4), 999.0)
+        decoy_loss_mask = torch.zeros((2, 4), dtype=torch.bool)
+
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {
+                    "input_ids": decoy_ids,
+                    "advantages": decoy_adv,
+                    "loss_mask": decoy_loss_mask,
+                },
+            },
+        )
+
+        expected_ids = torch.tensor([[1, 2, 3, 4], [7, 8, 0, 0]])
+        assert torch.equal(out["context"]["input_ids"], expected_ids)
+        assert not torch.equal(out["context"]["input_ids"], decoy_ids)
+        assert not torch.equal(out["context"]["advantages"], decoy_adv)
+        assert not torch.equal(out["context"]["loss_mask"], decoy_loss_mask)
+        loss_mask, moved_adv = out["context"]["loss_mask"], out["context"]["advantages"]
+        assert out["context"]["input_ids"][1][loss_mask[1]].tolist() == [7, 8]
+        assert moved_adv[1][loss_mask[1]].tolist() == [-0.25, -0.25]
+
+
     def test_left_pads_are_rewritten_to_trailing_pads(self):
         """SkyRL left-pads to the batch's longest sequence; Cortex's packer
         rejects that outright ("packing requires left-aligned rows")."""
@@ -990,6 +1085,38 @@ class TestCortexSharedHelper:
         assert out["processing"]["loss_fn"] == "grpo"
         assert cfg["global_batch_size"] == 128  # meta fallback still applied
 
+    def test_caller_config_keys_are_not_duplicated_onto_context(self):
+        """``global_batch_size`` and ``batch_num_tokens`` are config-shaping
+        knobs, not context data. When the caller's own ``processing.config``
+        already set one, the meta copy of that same key must not also land
+        on ``context`` -- the caller's config value already won in
+        ``proc_config``, so a stale/redundant meta copy next to it on context
+        would be at best noise and at worst a mismatched duplicate."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"global_batch_size": 128, "batch_num_tokens": 10},
+            },
+            processing={
+                "config": {"global_batch_size": 256, "batch_num_tokens": 20},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["global_batch_size"] == 256
+        assert cfg["batch_num_tokens"] == 20
+        assert "global_batch_size" not in out["context"]
+        assert "batch_num_tokens" not in out["context"]
+
     def test_missing_response_mask_fails_loud(self):
         """Falling back to ``attention_mask`` would silently train on prompt
         tokens; refuse instead of producing a wrong-but-plausible gradient."""
@@ -1120,3 +1247,38 @@ class TestCortexShimForwardsLikeOnPrem:
         out = asyncio.run(self._shim(Client()).fwd_no_grad(self._batch(), reference_model=False))
         assert out["batch"]["logprobs"].shape == (2, 5)
         assert float(out["batch"]["logprobs"].sum()) == 10.0
+def _zorro_worker(**zorro):
+    return TrainingConfig(ds_worker_config=zorro)
+
+
+def test_zorro_is_only_compatible_with_arctic_rl_client(monkeypatch):
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    enabled = {"zorro_train_enable": True}
+    sft = ArcticSFTClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config=enabled),
+    )
+    plain = ArcticClientConfig(model_name="m", training_gpus=1, training=_zorro_worker(**enabled))
+    nested = ArcticClientConfig(
+        model_name="m",
+        training_gpus=1,
+        training=_zorro_worker(zorro_train={"enable": True, "response_len": 8, "temperature": 1.0}),
+    )
+
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticSFTClient(sft)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        ArcticClient(plain)
+    with pytest.raises(ValueError, match="only compatible with ArcticRLClient"):
+        AsyncArcticClient(nested)
+
+    ArcticSFTClient(
+        ArcticSFTClientConfig(
+            model_name="m",
+            training_gpus=1,
+            training=TrainingConfig(checkpoint_path="/tmp/c", ds_worker_config={"zorro_train_enable": False}),
+        )
+    )
+    ArcticRLClient(plain)
+    AsyncArcticRLClient(nested)

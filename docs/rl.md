@@ -454,6 +454,21 @@ Shell override: `remote_backend.train.zorro_train.enable=True`.
 > README shorthand `zorro_train.enable` refers to the **verl yaml** path. The
 > server/client flat key is `ds_worker_config.zorro_train_enable`.
 
+`ArcticRLClient` and `AsyncArcticRLClient` accept the flat key.
+`ArcticClient`, `AsyncArcticClient`, and `ArcticSFTClient` raise `ValueError`
+at construction when `zorro_train_enable` is truthy, and when a nested
+`zorro_train.enable` dict is sitting on `ds_worker_config`. A later per-call
+`meta["zorro_train_enable"]` is not checked at the client.
+
+A Cortex `fwd_bwd` that sets `zorro_train_enable` must also send
+`max_prompt_len`. The payload builder raises `ValueError` naming that key
+when it is missing, and copies the remaining ZoRRo scalars onto context.
+`run_pipeline` then raises `ValueError` unless that training job was created
+with `ds_worker_config["zorro_train_enable"]`, which is what patches the model.
+A request that only sets the per-call flag against an unpatched model is rejected.
+On-prem `fwd_bwd` and `fwd_no_grad` both call `run_pipeline`. Cortex
+`fwd_no_grad` sends the same meta through `forward`.
+
 ## ZoRRo Inference (Forest Cascade Attention)
 
 **What:** During decode, groups requests that share a KV-cache prefix and runs

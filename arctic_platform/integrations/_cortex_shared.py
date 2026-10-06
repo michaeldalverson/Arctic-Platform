@@ -197,6 +197,10 @@ def to_cortex_fwd_bwd_payload(
         tensors = dict(payload)
         meta = dict(tensors.pop("context", None) or {})
 
+    missing_zorro = _missing_zorro_meta_keys(meta)
+    if missing_zorro:
+        raise ValueError("ZoRRo meta is missing " + ", ".join(missing_zorro))
+
     input_ids = tensors.get("input_ids")
     attention_mask = tensors.get("attention_mask")
     if input_ids is None or attention_mask is None:
@@ -227,11 +231,6 @@ def to_cortex_fwd_bwd_payload(
         scored["old_log_probs_shifted"] = old_log_probs_shifted.to(torch.float32)
     forwarded, scored, attention_mask = _left_align_batch(forwarded, attention_mask, scored)
     input_ids = forwarded["input_ids"]
-    context: dict[str, Any] = {
-        "input_ids": input_ids,
-        **scored,
-        **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
-    }
 
     kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
     for k in ("position_ids", "labels"):
@@ -244,6 +243,16 @@ def to_cortex_fwd_bwd_payload(
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
 
+    # Non-tensor meta reaches the worker. Aligned batch tensors win over any
+    # copy that arrived on meta. dp_size stays off the wire: the server treats
+    # it as a loss divisor.
+    forwarded_meta = {
+        key: value for key, value in meta.items() if key != "dp_size" and not torch.is_tensor(value)
+    }
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k in caller_config:
+            forwarded_meta.pop(k, None)
+    context = {**forwarded_meta, "input_ids": input_ids, **scored}
     from arctic_platform.common.balance_metadata import apply_balance_metadata
 
     apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
