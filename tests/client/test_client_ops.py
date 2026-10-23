@@ -868,6 +868,8 @@ class TestCortexSharedHelper:
                     "pad_token_id": 0,
                     "global_batch_size": 2,
                     "dp_size": 8,
+                    "balance_batch": True,
+                    "prompt_group_ids": torch.tensor([0, 0]),
                 },
             },
         )
@@ -882,6 +884,8 @@ class TestCortexSharedHelper:
         assert torch.equal(out["kwargs"]["old_log_probs"], old)
         assert "old_log_probs" not in out["context"]
         assert out["processing"]["loss_fn"] == "verl_grpo"
+        assert out["context"]["balance_batch"] is True
+        assert torch.equal(out["context"]["prompt_group_ids"], torch.tensor([0, 0]))
 
     def test_rejects_zorro_meta_that_is_missing_max_prompt_len(self):
         import pytest

@@ -336,6 +336,9 @@ def _to_cortex_zorro_payload(
     for key in _ZORRO_CONTEXT_SCALARS:
         if key in meta:
             context[key] = meta[key]
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    apply_balance_metadata(context, meta, input_ids, prompts)
 
     return {
         "args": (),
